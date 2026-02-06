@@ -4,10 +4,8 @@ import wave
 import uuid
 import json
 import time
-import queue
 import asyncio
 import traceback
-import threading
 import opuslib_next
 from abc import ABC, abstractmethod
 from config.logger import setup_logging
@@ -27,22 +25,15 @@ class ASRProviderBase(ABC):
 
     # 打开音频通道
     async def open_audio_channels(self, conn):
-        conn.asr_priority_thread = threading.Thread(
-            target=self.asr_text_priority_thread, args=(conn,), daemon=True
-        )
-        conn.asr_priority_thread.start()
+        conn.asr_priority_task = asyncio.create_task(self.asr_text_priority_thread(conn))
 
     # 有序处理ASR音频
-    def asr_text_priority_thread(self, conn):
+    async def asr_text_priority_thread(self, conn):
         while not conn.stop_event.is_set():
             try:
-                message = conn.asr_audio_queue.get(timeout=1)
-                future = asyncio.run_coroutine_threadsafe(
-                    handleAudioMessage(conn, message),
-                    conn.loop,
-                )
-                future.result()
-            except queue.Empty:
+                message = await asyncio.wait_for(conn.asr_audio_queue.get(), timeout=1)
+                await handleAudioMessage(conn, message)
+            except asyncio.TimeoutError:
                 continue
             except Exception as e:
                 logger.bind(tag=TAG).error(
@@ -151,6 +142,11 @@ class ASRProviderBase(ABC):
             # 性能监控
             total_time = time.monotonic() - total_start_time
             logger.bind(tag=TAG).debug(f"总处理耗时: {total_time:.3f}s")
+            slow_threshold = conn.config.get("performance", {}).get("asr_slow_ms", 1500)
+            if total_time * 1000 > slow_threshold:
+                logger.bind(tag=TAG).warning(
+                    f"ASR处理耗时 {total_time * 1000:.1f}ms, 超过阈值 {slow_threshold}ms"
+                )
 
             # 检查文本长度
             text_len, _ = remove_punctuation_and_length(content_for_length_check)

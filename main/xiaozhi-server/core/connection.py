@@ -95,6 +95,9 @@ class ConnectionHandler:
         self.loop = None  # 在 handle_connection 中获取运行中的事件循环
         self.stop_event = threading.Event()
         self.executor = ThreadPoolExecutor(max_workers=5)
+        self.queue_config = self.config.get("queue", {})
+        self.performance_config = self.config.get("performance", {})
+        self._last_queue_log_time = 0.0
 
         # 添加上报线程池
         self.report_queue = queue.Queue()
@@ -129,7 +132,9 @@ class ConnectionHandler:
         # 因为实际部署时可能会用到公共的本地ASR，不能把变量暴露给公共ASR
         # 所以涉及到ASR的变量，需要在这里定义，属于connection的私有变量
         self.asr_audio = []
-        self.asr_audio_queue = queue.Queue()
+        self.asr_audio_queue = asyncio.Queue(
+            maxsize=int(self.queue_config.get("asr_audio_maxsize", 200))
+        )
         self.current_speaker = None  # 存储当前说话人
         self.current_language_tag = None  # 存储当前ASR识别的语言标签
 
@@ -200,20 +205,16 @@ class ConnectionHandler:
             self.first_activity_time = time.time() * 1000
             self.last_activity_time = time.time() * 1000
 
-            # 启动超时检查任务
-            self.timeout_task = asyncio.create_task(self._check_timeout())
-
             self.welcome_msg = self.config["xiaozhi"]
             self.welcome_msg["session_id"] = self.session_id
 
-            # 在后台初始化配置和组件（完全不阻塞主循环）
-            asyncio.create_task(self._background_initialize())
-
-            try:
-                async for message in self.websocket:
-                    await self._route_message(message)
-            except websockets.exceptions.ConnectionClosed:
-                self.logger.bind(tag=TAG).info("客户端断开连接")
+            async with asyncio.TaskGroup() as task_group:
+                # 启动超时检查任务
+                self.timeout_task = task_group.create_task(self._check_timeout())
+                # 在后台初始化配置和组件（完全不阻塞主循环）
+                task_group.create_task(self._background_initialize())
+                # 处理 websocket 消息
+                task_group.create_task(self._consume_websocket_messages())
 
         except AuthenticationError as e:
             self.logger.bind(tag=TAG).error(f"Authentication failed: {str(e)}")
@@ -231,9 +232,20 @@ class ConnectionHandler:
                 try:
                     await self.close(ws)
                 except Exception as close_error:
-                    self.logger.bind(tag=TAG).error(
-                        f"强制关闭连接时出错: {close_error}"
-                    )
+                self.logger.bind(tag=TAG).error(
+                    f"强制关闭连接时出错: {close_error}"
+                )
+
+    async def _consume_websocket_messages(self):
+        try:
+            async for message in self.websocket:
+                await self._route_message(message)
+        except websockets.exceptions.ConnectionClosed:
+            self.logger.bind(tag=TAG).info("客户端断开连接")
+        except Exception as e:
+            self.logger.bind(tag=TAG).error(f"读取消息失败: {e}")
+        finally:
+            self.stop_event.set()
 
     async def _save_and_close(self, ws):
         """保存记忆并关闭连接"""
@@ -315,7 +327,7 @@ class ConnectionHandler:
                     return
 
             # 不需要头部处理或没有头部时，直接处理原始消息
-            self.asr_audio_queue.put(message)
+            self._enqueue_asr_audio(message)
 
     async def _process_mqtt_audio_message(self, message):
         """
@@ -342,13 +354,55 @@ class ConnectionHandler:
             elif len(message) > 16:
                 # 没有指定长度或长度无效，去掉头部后处理剩余数据
                 audio_data = message[16:]
-                self.asr_audio_queue.put(audio_data)
+                self._enqueue_asr_audio(audio_data)
                 return True
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"解析WebSocket音频包失败: {e}")
 
         # 处理失败，返回False表示需要继续处理
         return False
+
+    def _enqueue_asr_audio(self, audio_data):
+        self._enqueue_async_queue(
+            self.asr_audio_queue,
+            audio_data,
+            queue_name="asr_audio_queue",
+            drop_policy=self.queue_config.get("drop_policy", "drop_oldest"),
+        )
+
+    def _enqueue_async_queue(self, queue_obj, item, queue_name, drop_policy):
+        if queue_obj is None:
+            return
+        try:
+            queue_obj.put_nowait(item)
+        except asyncio.QueueFull:
+            if drop_policy == "drop_oldest":
+                try:
+                    queue_obj.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    queue_obj.put_nowait(item)
+                except asyncio.QueueFull:
+                    self.logger.bind(tag=TAG).warning(
+                        f"{queue_name} 满，丢弃新数据"
+                    )
+            else:
+                self.logger.bind(tag=TAG).warning(
+                    f"{queue_name} 满，丢弃新数据"
+                )
+        self._log_queue_stats()
+
+    def _log_queue_stats(self):
+        now = time.monotonic()
+        log_interval = float(self.queue_config.get("log_interval_seconds", 30))
+        if now - self._last_queue_log_time < log_interval:
+            return
+        self._last_queue_log_time = now
+        if hasattr(self, "asr_audio_queue") and self.asr_audio_queue:
+            self.logger.bind(tag=TAG).debug(
+                f"队列状态: asr_audio_queue={self.asr_audio_queue.qsize()}"
+            )
 
     def _process_websocket_audio(self, audio_data, timestamp):
         """处理WebSocket格式的音频包"""
@@ -360,7 +414,7 @@ class ConnectionHandler:
 
         # 如果时间戳是递增的，直接处理
         if timestamp >= self.last_processed_timestamp:
-            self.asr_audio_queue.put(audio_data)
+            self._enqueue_asr_audio(audio_data)
             self.last_processed_timestamp = timestamp
 
             # 处理缓冲区中的后续包
@@ -370,7 +424,7 @@ class ConnectionHandler:
                 for ts in sorted(self.audio_timestamp_buffer.keys()):
                     if ts > self.last_processed_timestamp:
                         buffered_audio = self.audio_timestamp_buffer.pop(ts)
-                        self.asr_audio_queue.put(buffered_audio)
+                        self._enqueue_asr_audio(buffered_audio)
                         self.last_processed_timestamp = ts
                         processed_any = True
                         break
@@ -379,7 +433,7 @@ class ConnectionHandler:
             if len(self.audio_timestamp_buffer) < self.max_timestamp_buffer_size:
                 self.audio_timestamp_buffer[timestamp] = audio_data
             else:
-                self.asr_audio_queue.put(audio_data)
+                self._enqueue_asr_audio(audio_data)
 
     async def handle_restart(self, message):
         """处理服务器重启请求"""
@@ -662,6 +716,9 @@ class ConnectionHandler:
         if private_config.get("context_providers", None) is not None:
             self.config["context_providers"] = private_config["context_providers"]
 
+        self.queue_config = self.config.get("queue", {})
+        self.performance_config = self.config.get("performance", {})
+
         # 使用 run_in_executor 在线程池中执行 initialize_modules，避免阻塞主循环
         try:
             modules = await self.loop.run_in_executor(
@@ -797,7 +854,7 @@ class ConnectionHandler:
             self.llm_finish_task = False
             self.sentence_id = str(uuid.uuid4().hex)
             self.dialogue.put(Message(role="user", content=query))
-            self.tts.tts_text_queue.put(
+            self.tts.enqueue_tts_text(
                 TTSMessageDTO(
                     sentence_id=self.sentence_id,
                     sentence_type=SentenceType.FIRST,
@@ -901,7 +958,7 @@ class ConnectionHandler:
             if content is not None and len(content) > 0:
                 if not tool_call_flag:
                     response_message.append(content)
-                    self.tts.tts_text_queue.put(
+                    self.tts.enqueue_tts_text(
                         TTSMessageDTO(
                             sentence_id=self.sentence_id,
                             sentence_type=SentenceType.MIDDLE,
@@ -982,7 +1039,7 @@ class ConnectionHandler:
             self.tts_MessageText = text_buff
             self.dialogue.put(Message(role="assistant", content=text_buff))
         if depth == 0:
-            self.tts.tts_text_queue.put(
+            self.tts.enqueue_tts_text(
                 TTSMessageDTO(
                     sentence_id=self.sentence_id,
                     sentence_type=SentenceType.LAST,
@@ -1191,13 +1248,14 @@ class ConnectionHandler:
                 self.tts.tts_text_queue,
                 self.tts.tts_audio_queue,
                 self.report_queue,
+                self.asr_audio_queue,
             ]:
                 if not q:
                     continue
                 while True:
                     try:
                         q.get_nowait()
-                    except queue.Empty:
+                    except (queue.Empty, asyncio.QueueEmpty):
                         break
 
             # 重置音频流控器（取消后台任务并清空队列）

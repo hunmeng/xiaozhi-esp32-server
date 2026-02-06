@@ -2,7 +2,6 @@ import os
 import uuid
 import json
 import time
-import queue
 import asyncio
 import traceback
 import websockets
@@ -92,11 +91,11 @@ class TTSProvider(TTSProviderBase):
             self.last_active_time = None
             raise
 
-    def tts_text_priority_thread(self):
-        """流式TTS文本处理线程"""
+    async def tts_text_priority_thread(self):
+        """流式TTS文本处理任务"""
         while not self.conn.stop_event.is_set():
             try:
-                message = self.tts_text_queue.get(timeout=1)
+                message = await asyncio.wait_for(self.tts_text_queue.get(), timeout=1)
                 logger.bind(tag=TAG).debug(
                     f"收到TTS任务｜{message.sentence_type.name} ｜ {message.content_type.name} | 会话ID: {self.conn.sentence_id}"
                 )
@@ -120,11 +119,7 @@ class TTSProvider(TTSProviderBase):
                             logger.bind(tag=TAG).info(f"自动生成新的 会话ID: {self.conn.sentence_id}")
 
                         logger.bind(tag=TAG).info("开始启动TTS会话...")
-                        future = asyncio.run_coroutine_threadsafe(
-                            self.start_session(self.conn.sentence_id),
-                            loop=self.conn.loop,
-                        )
-                        future.result()
+                        await self.start_session(self.conn.sentence_id)
                         self.before_stop_play_files.clear()
                         logger.bind(tag=TAG).info("TTS会话启动成功")
                     except Exception as e:
@@ -137,11 +132,7 @@ class TTSProvider(TTSProviderBase):
                             logger.bind(tag=TAG).debug(
                                 f"开始发送TTS文本: {message.content_detail}"
                             )
-                            future = asyncio.run_coroutine_threadsafe(
-                                self.text_to_speak(message.content_detail, None),
-                                loop=self.conn.loop,
-                            )
-                            future.result()
+                            await self.text_to_speak(message.content_detail, None)
                             logger.bind(tag=TAG).debug("TTS文本发送成功")
                         except Exception as e:
                             logger.bind(tag=TAG).error(f"发送TTS文本失败: {str(e)}")
@@ -153,21 +144,23 @@ class TTSProvider(TTSProviderBase):
                     )
                     if message.content_file and os.path.exists(message.content_file):
                         # 先处理文件音频数据
-                        self._process_audio_file_stream(message.content_file, callback=lambda audio_data: self.handle_audio_file(audio_data, message.content_detail))
+                        await asyncio.to_thread(
+                            self._process_audio_file_stream,
+                            message.content_file,
+                            callback=lambda audio_data: self.handle_audio_file(
+                                audio_data, message.content_detail
+                            ),
+                        )
 
                 if message.sentence_type == SentenceType.LAST:
                     try:
                         logger.bind(tag=TAG).info("开始结束TTS会话...")
-                        future = asyncio.run_coroutine_threadsafe(
-                            self.finish_session(self.conn.sentence_id),
-                            loop=self.conn.loop,
-                        )
-                        future.result()
+                        await self.finish_session(self.conn.sentence_id)
                     except Exception as e:
                         logger.bind(tag=TAG).error(f"结束TTS会话失败: {str(e)}")
                         continue
 
-            except queue.Empty:
+            except asyncio.TimeoutError:
                 continue
             except Exception as e:
                 logger.bind(tag=TAG).error(
@@ -341,14 +334,14 @@ class TTSProvider(TTSProviderBase):
 
                             if event == "task-started":
                                 logger.bind(tag=TAG).debug("TTS任务启动成功~")
-                                self.tts_audio_queue.put((SentenceType.FIRST, [], None))
+                                self.enqueue_tts_audio((SentenceType.FIRST, [], None))
                             elif event == "result-generated":
                                 # 发送缓存的数据
                                 if self.conn.tts_MessageText:
                                     logger.bind(tag=TAG).info(
                                         f"句子语音生成成功： {self.conn.tts_MessageText}"
                                     )
-                                    self.tts_audio_queue.put(
+                                    self.enqueue_tts_audio(
                                         (SentenceType.FIRST, [], self.conn.tts_MessageText)
                                     )
                                     self.conn.tts_MessageText = None

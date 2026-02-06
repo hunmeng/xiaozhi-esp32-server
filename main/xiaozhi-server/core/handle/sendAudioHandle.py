@@ -18,6 +18,7 @@ async def sendAudioMessage(conn, sentenceType, audios, text):
         conn.logger.bind(tag=TAG).info(f"发送第一段语音: {text}")
         conn.tts.tts_audio_first_sentence = False
         await send_tts_message(conn, "start", None)
+        conn.tts_start_time = time.monotonic()
 
     if sentenceType == SentenceType.FIRST:
         # 同一句子的后续消息加入流控队列，其他情况立即发送
@@ -43,6 +44,14 @@ async def sendAudioMessage(conn, sentenceType, audios, text):
     if sentenceType == SentenceType.LAST:
         await send_tts_message(conn, "stop", None)
         conn.client_is_speaking = False
+        if getattr(conn, "tts_start_time", None):
+            total_ms = (time.monotonic() - conn.tts_start_time) * 1000
+            threshold = conn.config.get("performance", {}).get("tts_slow_ms", 1500)
+            if total_ms > threshold:
+                conn.logger.bind(tag=TAG).warning(
+                    f"TTS总耗时 {total_ms:.1f}ms, 超过阈值 {threshold}ms"
+                )
+            conn.tts_start_time = None
         if conn.close_after_chat:
             await conn.close()
 
@@ -59,7 +68,15 @@ async def _wait_for_audio_completion(conn):
         conn.logger.bind(tag=TAG).debug(
             f"等待音频发送完成，队列中还有 {len(rate_controller.queue)} 个包"
         )
-        await rate_controller.queue_empty_event.wait()
+        timeout_s = (
+            conn.config.get("performance", {}).get("audio_completion_timeout_s", 10)
+        )
+        try:
+            await asyncio.wait_for(rate_controller.queue_empty_event.wait(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            conn.logger.bind(tag=TAG).warning(
+                f"等待音频发送完成超时({timeout_s}s)，继续关闭流程"
+            )
 
         # 等待预缓冲包播放完成
         # 前N个包直接发送，增加2个网络抖动包，需要额外等待它们在客户端播放完成
@@ -244,10 +261,19 @@ async def _do_send_audio(conn, opus_packet, flow_control):
         # 计算时间戳（基于播放位置）
         start_time = time.time()
         timestamp = int(start_time * 1000) % (2**32)
+        send_start = time.monotonic()
         await _send_to_mqtt_gateway(conn, opus_packet, timestamp, sequence)
     else:
         # 直接发送opus数据包
+        send_start = time.monotonic()
         await conn.websocket.send(opus_packet)
+
+    send_cost_ms = (time.monotonic() - send_start) * 1000
+    slow_threshold = conn.config.get("performance", {}).get("ws_send_slow_ms", 200)
+    if send_cost_ms > slow_threshold:
+        conn.logger.bind(tag=TAG).warning(
+            f"WebSocket发送耗时 {send_cost_ms:.1f}ms, 超过阈值 {slow_threshold}ms"
+        )
 
     # 更新流控状态
     flow_control["packet_count"] = packet_index + 1
@@ -278,7 +304,14 @@ async def send_tts_message(conn, state, text=None):
         conn.clearSpeakStatus()
 
     # 发送消息到客户端
+    send_start = time.monotonic()
     await conn.websocket.send(json.dumps(message))
+    send_cost_ms = (time.monotonic() - send_start) * 1000
+    slow_threshold = conn.config.get("performance", {}).get("ws_send_slow_ms", 200)
+    if send_cost_ms > slow_threshold:
+        conn.logger.bind(tag=TAG).warning(
+            f"WebSocket发送耗时 {send_cost_ms:.1f}ms, 超过阈值 {slow_threshold}ms"
+        )
 
 
 async def send_stt_message(conn, text):

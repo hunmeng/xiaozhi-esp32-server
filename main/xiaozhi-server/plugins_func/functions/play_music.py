@@ -217,14 +217,14 @@ async def play_local_music(conn, specific_file=None):
         conn.dialogue.put(Message(role="assistant", content=text))
 
         if conn.intent_type == "intent_llm":
-            conn.tts.tts_text_queue.put(
+            conn.tts.enqueue_tts_text(
                 TTSMessageDTO(
                     sentence_id=conn.sentence_id,
                     sentence_type=SentenceType.FIRST,
                     content_type=ContentType.ACTION,
                 )
             )
-        conn.tts.tts_text_queue.put(
+        conn.tts.enqueue_tts_text(
             TTSMessageDTO(
                 sentence_id=conn.sentence_id,
                 sentence_type=SentenceType.MIDDLE,
@@ -232,7 +232,7 @@ async def play_local_music(conn, specific_file=None):
                 content_detail=text,
             )
         )
-        conn.tts.tts_text_queue.put(
+        conn.tts.enqueue_tts_text(
             TTSMessageDTO(
                 sentence_id=conn.sentence_id,
                 sentence_type=SentenceType.MIDDLE,
@@ -241,7 +241,7 @@ async def play_local_music(conn, specific_file=None):
             )
         )
         if conn.intent_type == "intent_llm":
-            conn.tts.tts_text_queue.put(
+            conn.tts.enqueue_tts_text(
                 TTSMessageDTO(
                     sentence_id=conn.sentence_id,
                     sentence_type=SentenceType.LAST,

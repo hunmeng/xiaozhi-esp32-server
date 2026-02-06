@@ -2,9 +2,7 @@ import os
 import re
 import time
 import uuid
-import queue
 import asyncio
-import threading
 import traceback
 from core.utils import p3
 from datetime import datetime
@@ -35,8 +33,15 @@ class TTSProviderBase(ABC):
         self.delete_audio_file = delete_audio_file
         self.audio_file_type = "wav"
         self.output_file = config.get("output_dir", "tmp/")
-        self.tts_text_queue = queue.Queue()
-        self.tts_audio_queue = queue.Queue()
+        queue_config = config.get("queue", {})
+        self.tts_text_queue = asyncio.Queue(
+            maxsize=int(queue_config.get("tts_text_maxsize", 200))
+        )
+        self.tts_audio_queue = asyncio.Queue(
+            maxsize=int(queue_config.get("tts_audio_maxsize", 400))
+        )
+        self.drop_policy = queue_config.get("drop_policy", "drop_oldest")
+        self._last_queue_log_time = 0.0
         self.tts_audio_first_sentence = True
         self.before_stop_play_files = []
 
@@ -77,22 +82,25 @@ class TTSProviderBase(ABC):
 
     def handle_opus(self, opus_data: bytes):
         logger.bind(tag=TAG).debug(f"推送数据到队列里面帧数～～ {len(opus_data)}")
-        self.tts_audio_queue.put((SentenceType.MIDDLE, opus_data, None))
+        self.enqueue_tts_audio((SentenceType.MIDDLE, opus_data, None))
 
     def handle_audio_file(self, file_audio: bytes, text):
         self.before_stop_play_files.append((file_audio, text))
 
-    def to_tts_stream(self, text, opus_handler: Callable[[bytes], None] = None) -> None:
+    async def to_tts_stream(
+        self, text, opus_handler: Callable[[bytes], None] = None
+    ) -> None:
         text = MarkdownCleaner.clean_markdown(text)
         max_repeat_time = 5
         if self.delete_audio_file:
             # 需要删除文件的直接转为音频数据
             while max_repeat_time > 0:
                 try:
-                    audio_bytes = asyncio.run(self.text_to_speak(text, None))
+                    audio_bytes = await self.text_to_speak(text, None)
                     if audio_bytes:
-                        self.tts_audio_queue.put((SentenceType.FIRST, None, text))
-                        audio_bytes_to_data_stream(
+                        self.enqueue_tts_audio((SentenceType.FIRST, None, text))
+                        await asyncio.to_thread(
+                            audio_bytes_to_data_stream,
                             audio_bytes,
                             file_type=self.audio_file_type,
                             is_opus=True,
@@ -120,7 +128,7 @@ class TTSProviderBase(ABC):
             try:
                 while not os.path.exists(tmp_file) and max_repeat_time > 0:
                     try:
-                        asyncio.run(self.text_to_speak(text, tmp_file))
+                        await self.text_to_speak(text, tmp_file)
                     except Exception as e:
                         logger.bind(tag=TAG).warning(
                             f"语音生成失败{5 - max_repeat_time + 1}次: {text}，错误: {e}"
@@ -138,8 +146,10 @@ class TTSProviderBase(ABC):
                     logger.bind(tag=TAG).error(
                         f"语音生成失败: {text}，请检查网络或服务是否正常"
                     )
-                    self.tts_audio_queue.put((SentenceType.FIRST, None, text))
-                self._process_audio_file_stream(tmp_file, callback=opus_handler)
+                    self.enqueue_tts_audio((SentenceType.FIRST, None, text))
+                await asyncio.to_thread(
+                    self._process_audio_file_stream, tmp_file, callback=opus_handler
+                )
             except Exception as e:
                 logger.bind(tag=TAG).error(f"Failed to generate TTS file: {e}")
                 return None
@@ -240,7 +250,7 @@ class TTSProviderBase(ABC):
         # 对于单句的文本，进行分段处理
         segments = re.split(r"([。！？!?；;\n])", content_detail)
         for seg in segments:
-            self.tts_text_queue.put(
+            self.enqueue_tts_text(
                 TTSMessageDTO(
                     sentence_id=sentence_id,
                     sentence_type=SentenceType.MIDDLE,
@@ -252,24 +262,19 @@ class TTSProviderBase(ABC):
 
     async def open_audio_channels(self, conn):
         self.conn = conn
-        # tts 消化线程
-        self.tts_priority_thread = threading.Thread(
-            target=self.tts_text_priority_thread, daemon=True
+        # tts 消化任务
+        self.tts_priority_task = asyncio.create_task(self.tts_text_priority_thread())
+        # 音频播放 消化任务
+        self.audio_play_priority_task = asyncio.create_task(
+            self._audio_play_priority_thread()
         )
-        self.tts_priority_thread.start()
-
-        # 音频播放 消化线程
-        self.audio_play_priority_thread = threading.Thread(
-            target=self._audio_play_priority_thread, daemon=True
-        )
-        self.audio_play_priority_thread.start()
 
     # 这里默认是非流式的处理方式
     # 流式处理方式请在子类中重写
-    def tts_text_priority_thread(self):
+    async def tts_text_priority_thread(self):
         while not self.conn.stop_event.is_set():
             try:
-                message = self.tts_text_queue.get(timeout=1)
+                message = await asyncio.wait_for(self.tts_text_queue.get(), timeout=1)
                 if message.sentence_type == SentenceType.FIRST:
                     self.conn.client_abort = False
                 if self.conn.client_abort:
@@ -286,21 +291,29 @@ class TTSProviderBase(ABC):
                     self.tts_text_buff.append(message.content_detail)
                     segment_text = self._get_segment_text()
                     if segment_text:
-                        self.to_tts_stream(segment_text, opus_handler=self.handle_opus)
+                        await self.to_tts_stream(
+                            segment_text, opus_handler=self.handle_opus
+                        )
                 elif ContentType.FILE == message.content_type:
-                    self._process_remaining_text_stream(opus_handler=self.handle_opus)
+                    await self._process_remaining_text_stream(
+                        opus_handler=self.handle_opus
+                    )
                     tts_file = message.content_file
                     if tts_file and os.path.exists(tts_file):
-                        self._process_audio_file_stream(
-                            tts_file, callback=self.handle_opus
+                        await asyncio.to_thread(
+                            self._process_audio_file_stream,
+                            tts_file,
+                            callback=self.handle_opus,
                         )
                 if message.sentence_type == SentenceType.LAST:
-                    self._process_remaining_text_stream(opus_handler=self.handle_opus)
-                    self.tts_audio_queue.put(
+                    await self._process_remaining_text_stream(
+                        opus_handler=self.handle_opus
+                    )
+                    self.enqueue_tts_audio(
                         (message.sentence_type, [], message.content_detail)
                     )
 
-            except queue.Empty:
+            except asyncio.TimeoutError:
                 continue
             except Exception as e:
                 logger.bind(tag=TAG).error(
@@ -308,7 +321,7 @@ class TTSProviderBase(ABC):
                 )
                 continue
 
-    def _audio_play_priority_thread(self):
+    async def _audio_play_priority_thread(self):
         # 需要上报的文本和音频列表
         enqueue_text = None
         enqueue_audio = None
@@ -316,10 +329,10 @@ class TTSProviderBase(ABC):
             text = None
             try:
                 try:
-                    sentence_type, audio_datas, text = self.tts_audio_queue.get(
-                        timeout=0.1
+                    sentence_type, audio_datas, text = await asyncio.wait_for(
+                        self.tts_audio_queue.get(), timeout=0.1
                     )
-                except queue.Empty:
+                except asyncio.TimeoutError:
                     if self.conn.stop_event.is_set():
                         break
                     continue
@@ -342,11 +355,7 @@ class TTSProviderBase(ABC):
                     enqueue_audio.append(audio_datas)
 
                 # 发送音频
-                future = asyncio.run_coroutine_threadsafe(
-                    sendAudioMessage(self.conn, sentence_type, audio_datas, text),
-                    self.conn.loop,
-                )
-                future.result()
+                await sendAudioMessage(self.conn, sentence_type, audio_datas, text)
 
                 # 记录输出和报告
                 if self.conn.max_output_size > 0 and text:
@@ -431,11 +440,11 @@ class TTSProviderBase(ABC):
 
     def _process_before_stop_play_files(self):
         for audio_datas, text in self.before_stop_play_files:
-            self.tts_audio_queue.put((SentenceType.MIDDLE, audio_datas, text))
+            self.enqueue_tts_audio((SentenceType.MIDDLE, audio_datas, text))
         self.before_stop_play_files.clear()
-        self.tts_audio_queue.put((SentenceType.LAST, [], None))
+        self.enqueue_tts_audio((SentenceType.LAST, [], None))
 
-    def _process_remaining_text_stream(
+    async def _process_remaining_text_stream(
         self, opus_handler: Callable[[bytes], None] = None
     ):
         """处理剩余的文本并生成语音
@@ -448,7 +457,51 @@ class TTSProviderBase(ABC):
         if remaining_text:
             segment_text = textUtils.get_string_no_punctuation_or_emoji(remaining_text)
             if segment_text:
-                self.to_tts_stream(segment_text, opus_handler=opus_handler)
+                await self.to_tts_stream(segment_text, opus_handler=opus_handler)
                 self.processed_chars += len(full_text)
                 return True
         return False
+
+    def enqueue_tts_text(self, message):
+        self._enqueue_queue(
+            self.tts_text_queue, message, queue_name="tts_text_queue"
+        )
+
+    def enqueue_tts_audio(self, message):
+        self._enqueue_queue(
+            self.tts_audio_queue, message, queue_name="tts_audio_queue"
+        )
+
+    def _enqueue_queue(self, queue_obj, message, queue_name):
+        if queue_obj is None:
+            return
+        try:
+            queue_obj.put_nowait(message)
+        except asyncio.QueueFull:
+            if self.drop_policy == "drop_oldest":
+                try:
+                    queue_obj.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    queue_obj.put_nowait(message)
+                except asyncio.QueueFull:
+                    logger.bind(tag=TAG).warning(f"{queue_name} 满，丢弃新数据")
+            else:
+                logger.bind(tag=TAG).warning(f"{queue_name} 满，丢弃新数据")
+        self._log_queue_stats()
+
+    def _log_queue_stats(self):
+        now = time.monotonic()
+        if not self.conn:
+            return
+        log_interval = float(
+            self.conn.config.get("queue", {}).get("log_interval_seconds", 30)
+        )
+        if now - self._last_queue_log_time < log_interval:
+            return
+        self._last_queue_log_time = now
+        logger.bind(tag=TAG).debug(
+            f"队列状态: tts_text_queue={self.tts_text_queue.qsize()}, "
+            f"tts_audio_queue={self.tts_audio_queue.qsize()}"
+        )

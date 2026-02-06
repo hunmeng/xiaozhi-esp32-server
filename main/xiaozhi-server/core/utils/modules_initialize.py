@@ -1,4 +1,5 @@
 from typing import Dict, Any
+import copy
 from config.logger import setup_logging
 from core.utils import tts, llm, intent, memory, vad, asr
 
@@ -105,9 +106,12 @@ def initialize_tts(config):
         if "type" not in config["TTS"][select_tts_module]
         else config["TTS"][select_tts_module]["type"]
     )
+    tts_config = copy.deepcopy(config["TTS"][select_tts_module])
+    tts_config["queue"] = config.get("queue", {})
+    tts_config["performance"] = config.get("performance", {})
     new_tts = tts.create_instance(
         tts_type,
-        config["TTS"][select_tts_module],
+        tts_config,
         str(config.get("delete_audio", True)).lower() in ("true", "1", "yes"),
     )
     return new_tts
@@ -148,4 +152,3 @@ def initialize_voiceprint(asr_instance, config):
     except Exception as e:
         logger.bind(tag=TAG).error(f"动态初始化声纹识别功能失败: {str(e)}")
         return False
-
