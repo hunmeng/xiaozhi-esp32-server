@@ -192,7 +192,7 @@ def speak_txt(conn, text):
     # 记录文本
     conn.tts_MessageText = text
 
-    conn.tts.tts_text_queue.put(
+    conn.tts.enqueue_tts_text(
         TTSMessageDTO(
             sentence_id=conn.sentence_id,
             sentence_type=SentenceType.FIRST,
@@ -200,7 +200,7 @@ def speak_txt(conn, text):
         )
     )
     conn.tts.tts_one_sentence(conn, ContentType.TEXT, content_detail=text)
-    conn.tts.tts_text_queue.put(
+    conn.tts.enqueue_tts_text(
         TTSMessageDTO(
             sentence_id=conn.sentence_id,
             sentence_type=SentenceType.LAST,
